@@ -18,14 +18,35 @@ use ssh_agent_lib::{
     proto::{Extension, Identity, Request, Response, SignRequest},
 };
 use ssh_key::Signature;
+use std::time::Instant;
+
+struct IndexedIdentity {
+    identity: Identity,
+    index: usize,
+}
 
 struct MuxAgent {
     targets: Vec<Box<dyn Session>>,
+    identity_cache: Vec<IndexedIdentity>,
+    identity_cache_instant: Option<Instant>,
 }
 
-#[async_trait]
-impl Session for MuxAgent {
-    async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
+const CACHE_INVALIDATE_TIME: u64 = 1;
+
+impl MuxAgent {
+    fn new(targets: Vec<Box<dyn Session>>) -> Self {
+        Self {
+            targets,
+            identity_cache: Vec::new(),
+            identity_cache_instant: None,
+        }
+    }
+
+    async fn update_cache(&mut self) -> Result<(), AgentError> {
+        if self.identity_cache_instant.is_some_and(|instant| instant.elapsed().as_secs() <= CACHE_INVALIDATE_TIME) {
+            return Ok(())
+        }
+
         let responses = join_all(
             self.targets
             .iter_mut()
@@ -33,8 +54,24 @@ impl Session for MuxAgent {
             )
             .await;
         let responses: Result<Vec<_>, _> = responses.into_iter().collect();
-        let response = responses?.into_iter().flatten().collect();
-        Ok(response)
+        let indexed_identities = responses?.into_iter().enumerate().flat_map(|(index, identities)| {
+            identities.into_iter().map(move |identity| IndexedIdentity { identity, index })
+        }).collect();
+
+        self.identity_cache_instant = Some(Instant::now());
+        self.identity_cache = indexed_identities;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Session for MuxAgent {
+    async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
+        self.update_cache().await?;
+        let identities = self.identity_cache.drain(0..).map(|indexed_identity| indexed_identity.identity).collect();
+        self.identity_cache_instant = None;
+        Ok(identities)
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
@@ -98,7 +135,7 @@ impl MuxAgentBind {
             .iter()
             .map(|target| connect(target.clone().try_into().unwrap()).unwrap())
             .collect();
-        MuxAgent { targets }
+        MuxAgent::new(targets)
     }
 }
 
