@@ -1,5 +1,5 @@
 //! Run with
-//! RUST_LOG=info cargo run -- --target unix://$SSH_AUTH_SOCK -H unix:///tmp/test.sock
+//! RUST_LOG=info cargo run -- --target unix://$SSH_AUTH_SOCK --target unix://$SSH_AUTH_SOCK --host unix:///tmp/test.sock
 //!
 //! Then
 //! SSH_AUTH_SOCK=/tmp/test.sock ssh-add -l
@@ -109,7 +109,7 @@ struct Args {
     targets: Vec<Binding>,
 
     /// Source that we will bind to.
-    #[clap(long, short = 'H')]
+    #[clap(long)]
     host: Binding,
 }
 
