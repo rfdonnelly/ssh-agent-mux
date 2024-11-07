@@ -15,76 +15,102 @@ use ssh_agent_lib::{
     async_trait,
     client::connect,
     error::AgentError,
-    proto::{Extension, Identity, Request, Response, SignRequest},
+    proto::{Extension, Identity, SignRequest},
+    // proto::{Request, Response},
 };
-use ssh_key::Signature;
-use std::time::Instant;
+use ssh_key::{public::KeyData, Signature};
 
-struct IndexedIdentity {
+struct IdentityIndex {
     identity: Identity,
-    index: usize,
+    target_index: usize,
+}
+
+struct KeyIndex {
+    key: KeyData,
+    target_index: usize,
 }
 
 struct MuxAgent {
     targets: Vec<Box<dyn Session>>,
-    identity_cache: Vec<IndexedIdentity>,
-    identity_cache_instant: Option<Instant>,
+    key_target_map: Vec<KeyIndex>,
 }
-
-const CACHE_INVALIDATE_TIME: u64 = 1;
 
 impl MuxAgent {
     fn new(targets: Vec<Box<dyn Session>>) -> Self {
         Self {
             targets,
-            identity_cache: Vec::new(),
-            identity_cache_instant: None,
+            key_target_map: Vec::new(),
         }
     }
 
-    async fn update_cache(&mut self) -> Result<(), AgentError> {
-        if self.identity_cache_instant.is_some_and(|instant| instant.elapsed().as_secs() <= CACHE_INVALIDATE_TIME) {
-            return Ok(())
-        }
-
-        let responses = join_all(
-            self.targets
-            .iter_mut()
-            .map(|target| target.request_identities()),
-            )
-            .await;
-        let responses: Result<Vec<_>, _> = responses.into_iter().collect();
-        let indexed_identities = responses?.into_iter().enumerate().flat_map(|(index, identities)| {
-            identities.into_iter().map(move |identity| IndexedIdentity { identity, index })
-        }).collect();
-
-        self.identity_cache_instant = Some(Instant::now());
-        self.identity_cache = indexed_identities;
-
-        Ok(())
+    fn update_indexes(&mut self, identity_indexes: &[IdentityIndex]) {
+        self.key_target_map = identity_indexes
+            .iter()
+            .map(|identity_index| KeyIndex {
+                target_index: identity_index.target_index,
+                key: identity_index.identity.pubkey.clone(),
+            })
+            .collect();
     }
 }
 
 #[async_trait]
 impl Session for MuxAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        self.update_cache().await?;
-        let identities = self.identity_cache.drain(0..).map(|indexed_identity| indexed_identity.identity).collect();
-        self.identity_cache_instant = None;
+        let responses = join_all(
+            self.targets
+                .iter_mut()
+                .map(|target| target.request_identities()),
+        )
+        .await;
+        let responses: Result<Vec<_>, _> = responses.into_iter().collect();
+        let responses = responses?;
+        let identity_indexes: Vec<_> = responses
+            .into_iter()
+            .enumerate()
+            .flat_map(|(target_index, identities)| {
+                identities.into_iter().map(move |identity| IdentityIndex {
+                    identity,
+                    target_index,
+                })
+            })
+            .collect();
+        self.update_indexes(&identity_indexes);
+
+        let identities = identity_indexes
+            .into_iter()
+            .map(|identity_index| identity_index.identity)
+            .collect();
         Ok(identities)
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        // TODO: demux based on key
         log::info!("sign request {request:?}");
-        let response = self.targets.first_mut().unwrap().sign(request).await?;
+        let target_index = self
+            .key_target_map
+            .iter()
+            .find(|key_index| key_index.key == request.pubkey)
+            .unwrap()
+            .target_index;
+        let response = self
+            .targets
+            .get_mut(target_index)
+            .unwrap()
+            .sign(request)
+            .await?;
         log::info!("sign response {response:?}");
         Ok(response)
     }
 
     async fn extension(&mut self, request: Extension) -> Result<Option<Extension>, AgentError> {
         log::info!("extension request {request:?}");
-        let response = self.targets.first_mut().unwrap().extension(request).await.unwrap_or(None);
+        let response = self
+            .targets
+            .first_mut()
+            .unwrap()
+            .extension(request)
+            .await
+            .unwrap_or(None);
         log::info!("extension response {response:?}");
         Ok(response)
     }
