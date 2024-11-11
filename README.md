@@ -11,7 +11,7 @@ This is a proof of concept.  Use at your own risk.
 ## Usage
 
 ```
-# Run multiplex 3 agents
+# Multiplex 3 agents
 cargo run -- \
   --target unix://$HOME/.ssh/agent1.sock
   --target unix://$HOME/.ssh/agent2.sock
